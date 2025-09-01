@@ -98,6 +98,39 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
+  export default async function handler(req, res) {
+  // CORS for bookmarklet
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+
+  // 🔧 DEBUG MODE (TEMP) — place EXACTLY here
+  try {
+    // Works on Vercel's Node runtime whether req.query is present or not
+    const url = new URL(req.url, `https://${req.headers.host || "localhost"}`);
+    const isDebug = url.searchParams.get("debug") === "1" || (req.query && req.query.debug === "1");
+    if (isDebug) {
+      return res.status(200).json({
+        ok: true,
+        method: req.method,
+        hasEnv: {
+          productId: !!process.env.GUMROAD_PRODUCT_ID_CFB,
+          cfbdKey:   !!process.env.CFBD_API_KEY,
+          oddsKey:   !!process.env.ODDS_API_KEY
+        },
+        note: "Debug mode response. Remove this block once verified."
+      });
+    }
+  } catch (_) { /* ignore */ }
+
+  // keep the rest of your original handler below this line:
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  try {
+    // ...paywall & main logic...
+
+
   try {
     // Paywall
     const licenseKey = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
