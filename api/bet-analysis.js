@@ -1,16 +1,14 @@
-// POST /api/bet-analysis  (CFB version: FPI for ratings + Odds + model + optional Claude)
+// POST /api/bet-analysis  (CFB: license-gated + FPI/odds best-effort, never hard-crash)
 // Auth: Authorization: Bearer <Gumroad license key>
 
-import Anthropic from "@anthropic-ai/sdk";
-
-// ---------- Config ----------
+// -------- Config --------
 const THE_ODDS_HOST = "https://api.the-odds-api.com/v4";
 const BOOKS = new Set(["draftkings", "fanduel", "betmgm"]);
 const CACHE_TTL = Number(process.env.GUMROAD_VERIFY_CACHE_SECS || 600);
 const CFB_HFA = Number(process.env.CFB_HFA || 1.7);
 
-// ---------- Simple in-memory cache for license ----------
-const _cache = new Map(); // resets on cold start
+// -------- Tiny in-memory cache for license --------
+const _cache = new Map();
 const getCache = (k) => {
   const v = _cache.get(k);
   if (!v) return null;
@@ -19,7 +17,7 @@ const getCache = (k) => {
 };
 const setCache = (k, data) => _cache.set(k, { t: Date.now(), data });
 
-// ---------- Helpers ----------
+// -------- Helpers --------
 const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
 
 async function verifyGumroad({ productId, licenseKey, increment = true }) {
@@ -33,8 +31,10 @@ async function verifyGumroad({ productId, licenseKey, increment = true }) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body
   });
+
   if (r.status === 404) return { ok: false, reason: "not_found" };
-  const j = await r.json();
+  let j;
+  try { j = await r.json(); } catch { return { ok:false, reason:"gumroad_json_error" }; }
   if (!j?.success) return { ok: false, reason: "invalid" };
 
   const p = j.purchase || {};
@@ -45,41 +45,51 @@ async function verifyGumroad({ productId, licenseKey, increment = true }) {
   return { ok: !inactive, reason: inactive ? "inactive" : null, data: j };
 }
 
-async function fetchOddsCFB(away, home) {
-  const url = `${THE_ODDS_HOST}/sports/americanfootball_ncaaf/odds?regions=us&markets=spreads&oddsFormat=american&apiKey=${encodeURIComponent(process.env.ODDS_API_KEY)}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Odds API error ${r.status}`);
-  const data = await r.json();
-
-  const A = norm(away), H = norm(home);
-  const ev = data.find(ev => norm(ev.away_team) === A && norm(ev.home_team) === H)
-          || data.find(ev => norm(ev.away_team).includes(A) && norm(ev.home_team).includes(H));
-  if (!ev) return { eventTitle: null, bookLine: null, bookmakerLines: [] };
-
-  const bookmakerLines = [];
-  for (const bm of ev.bookmakers || []) {
-    if (!BOOKS.has(bm.key)) continue;
-    const spreads = (bm.markets || []).find(m => m.key === "spreads");
-    if (!spreads) continue;
-    const homeOutcome = (spreads.outcomes || []).find(o => norm(o.name) === norm(ev.home_team));
-    if (!homeOutcome || typeof homeOutcome.point !== "number") continue;
-    bookmakerLines.push({ book: bm.key, homeLine: homeOutcome.point, last_update: bm.last_update });
-  }
-  bookmakerLines.sort((a,b)=>a.homeLine-b.homeLine);
-  const mid = bookmakerLines.length ? bookmakerLines[Math.floor(bookmakerLines.length/2)].homeLine : null;
-
-  return { eventTitle: `${ev.away_team} @ ${ev.home_team}`, bookLine: mid, bookmakerLines };
-}
-
 async function fetchFPI(team, year) {
+  if (!process.env.CFBD_API_KEY) return { fpi: null, note: "Missing CFBD_API_KEY" };
   const url = `https://api.collegefootballdata.com/ratings/fpi?year=${year}&team=${encodeURIComponent(team)}`;
-  const r = await fetch(url, { headers: { accept: "application/json", Authorization: `Bearer ${process.env.CFBD_API_KEY}` } });
-  if (!r.ok) return null;
-  const arr = await r.json();
-  return Array.isArray(arr) && arr.length ? arr[0] : null; // { team, fpi, ... }
+  try {
+    const r = await fetch(url, { headers: { accept: "application/json", Authorization: `Bearer ${process.env.CFBD_API_KEY}` } });
+    if (!r.ok) return { fpi: null, note: `CFBD ${r.status}` };
+    const arr = await r.json();
+    const rec = Array.isArray(arr) && arr.length ? arr[0] : null;
+    return { fpi: rec?.fpi ?? null, note: rec ? null : "FPI not found" };
+  } catch (e) {
+    return { fpi: null, note: "CFBD fetch failed" };
+  }
 }
 
-// ---------- Handler ----------
+async function fetchOddsCFB(away, home) {
+  if (!process.env.ODDS_API_KEY) return { eventTitle: null, bookLine: null, bookmakerLines: [], note: "Missing ODDS_API_KEY" };
+  const url = `${THE_ODDS_HOST}/sports/americanfootball_ncaaf/odds?regions=us&markets=spreads&oddsFormat=american&apiKey=${encodeURIComponent(process.env.ODDS_API_KEY)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return { eventTitle: null, bookLine: null, bookmakerLines: [], note: `Odds ${r.status}` };
+    const data = await r.json();
+    const A = norm(away), H = norm(home);
+    const ev = data.find(ev => norm(ev.away_team) === A && norm(ev.home_team) === H)
+            || data.find(ev => norm(ev.away_team).includes(A) && norm(ev.home_team).includes(H));
+    if (!ev) return { eventTitle: null, bookLine: null, bookmakerLines: [], note: "Event not found" };
+
+    const bookmakerLines = [];
+    for (const bm of ev.bookmakers || []) {
+      if (!BOOKS.has(bm.key)) continue;
+      const spreads = (bm.markets || []).find(m => m.key === "spreads");
+      if (!spreads) continue;
+      const homeOutcome = (spreads.outcomes || []).find(o => norm(o.name) === norm(ev.home_team));
+      if (!homeOutcome || typeof homeOutcome.point !== "number") continue;
+      bookmakerLines.push({ book: bm.key, homeLine: homeOutcome.point, last_update: bm.last_update });
+    }
+    bookmakerLines.sort((a,b)=>a.homeLine-b.homeLine);
+    const mid = bookmakerLines.length ? bookmakerLines[Math.floor(bookmakerLines.length/2)].homeLine : null;
+
+    return { eventTitle: `${ev.away_team} @ ${ev.home_team}`, bookLine: mid, bookmakerLines, note: null };
+  } catch (e) {
+    return { eventTitle: null, bookLine: null, bookmakerLines: [], note: "Odds fetch failed" };
+  }
+}
+
+// -------- Handler --------
 export default async function handler(req, res) {
   // CORS for bookmarklet
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -89,7 +99,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // --- Paywall (Gumroad CFB) ---
+    // Paywall
     const licenseKey = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
     if (!licenseKey) return res.status(401).json({ error: "Unauthorized" });
 
@@ -105,86 +115,51 @@ export default async function handler(req, res) {
       setCache(cacheKey, verified);
     }
 
-    // --- Inputs ---
+    // Inputs
     const { away = "", home = "", neutral = false, year } = req.body || {};
-    if (!away || !home) {
-      return res.status(400).json({ error: "Provide 'away' and 'home' team names." });
-    }
+    if (!away || !home) return res.status(400).json({ error: "Provide 'away' and 'home' team names." });
     const season = Number.isInteger(year) ? year : new Date().getFullYear();
 
-    // --- Ratings: FPI for both teams (primary power rating) ---
-    const awayFpi = await fetchFPI(away, season);
-    const homeFpi = await fetchFPI(home, season);
+    // Ratings: FPI for both teams
+    const [awayF, homeF] = await Promise.all([fetchFPI(away, season), fetchFPI(home, season)]);
 
-    if (!awayFpi?.fpi || !homeFpi?.fpi) {
-      return res.status(200).json({
-        ok: true,
-        league: "CFB",
-        away, home, neutral, year: season,
-        hfa: neutral ? 0 : CFB_HFA,
-        note: "FPI not found for one or both teams. Try using disambiguated names like 'Miami (FL)'.",
-        prUsed: { away: awayFpi?.fpi ?? null, home: homeFpi?.fpi ?? null },
-        bookLine: null, bookmakerLines: [],
-        analysis: "Missing FPI prevents model pick."
-      });
-    }
+    // Odds (best effort)
+    const odds = await fetchOddsCFB(away, home);
 
-    // --- Odds (TheOddsAPI: DK/FD/MGM consensus) ---
-    const { eventTitle, bookLine, bookmakerLines } = await fetchOddsCFB(away, home);
-
-    // --- Model spread (home perspective) ---
+    // Build response even if things are missing
     const hfa = neutral ? 0 : CFB_HFA;
-    const spread = Number((homeFpi.fpi - awayFpi.fpi + hfa).toFixed(1));
-    const fav = spread > 0 ? home : (spread < 0 ? away : "Pick'em");
-    const favAbs = Math.abs(spread).toFixed(1);
-    const sign = spread > 0 ? "-" : spread < 0 ? "+" : "";
-    const pickLine = fav === "Pick'em" ? "PK" : `${fav} ${sign}${favAbs}`;
-
-    const bookCompare = (typeof bookLine === "number")
-      ? `Consensus home line (DK/FD/MGM): ${bookLine > 0 ? `+${bookLine}` : bookLine}. Model edge = ${(spread - bookLine).toFixed(1)}.`
-      : "No consensus line available for this match right now.";
-
-    // --- Optional: Claude analysis ---
-    let analysis = "Set ANTHROPIC_API_KEY to enable AI analysis.";
-    if (process.env.ANTHROPIC_API_KEY) {
-      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-      const system = "You are a sharp betting analyst. ≤150 words. Use the model spread and compare to the market. Mention key numbers (3,7,10,14) if relevant. End with a clear pick.";
-      const user = `League: CFB
-Year: ${season}
-Away: ${away}
-Home: ${home}
-Neutral site: ${neutral ? "Yes" : "No"}
-HFA used: ${hfa}
-Ratings source: ESPN FPI (via CollegeFootballData)
-FPI used: ${away}=${awayFpi.fpi}, ${home}=${homeFpi.fpi}
-Model spread (Home - Away + HFA): ${spread} (${pickLine})
-${bookCompare}
-Books: DraftKings, FanDuel, BetMGM.
-Finish with: Play: ${pickLine} (model).`;
-
-      const msg = await anthropic.messages.create({
-        model: "claude-3-7-sonnet-20250219",
-        max_tokens: 400,
-        system,
-        messages: [{ role: "user", content: user }]
-      });
-      analysis = (Array.isArray(msg?.content) && msg.content[0]?.text) || "No analysis generated.";
+    let spread = null, fav = null, favAbs = null, pickLine = null, analysis = "Set ANTHROPIC_API_KEY and Claude later.";
+    if (typeof awayF.fpi === "number" && typeof homeF.fpi === "number") {
+      spread = Number((homeF.fpi - awayF.fpi + hfa).toFixed(1));
+      fav = spread > 0 ? home : (spread < 0 ? away : "Pick'em");
+      favAbs = Math.abs(spread).toFixed(1);
+      const sign = spread > 0 ? "-" : spread < 0 ? "+" : "";
+      pickLine = fav === "Pick'em" ? "PK" : `${fav} ${sign}${favAbs}`;
     }
+
+    const notes = [
+      awayF.note ? `awayFPI:${awayF.note}` : null,
+      homeF.note ? `homeFPI:${homeF.note}` : null,
+      odds.note ? `odds:${odds.note}` : null
+    ].filter(Boolean);
 
     return res.status(200).json({
       ok: true,
       league: "CFB",
-      eventTitle: eventTitle || `${away} @ ${home}`,
+      eventTitle: odds.eventTitle || `${away} @ ${home}`,
       away, home, neutral, year: season,
       hfa,
-      prUsed: { away: awayFpi.fpi, home: homeFpi.fpi },
-      spread, fav, favAbs,
-      bookLine: bookLine ?? null,
-      bookmakerLines,
+      prUsed: { away: awayF.fpi ?? null, home: homeF.fpi ?? null },
+      spread, fav, favAbs, pickLine,
+      bookLine: odds.bookLine ?? null,
+      bookmakerLines: odds.bookmakerLines,
+      notes: notes.length ? notes : undefined,
       analysis
     });
   } catch (e) {
-    return res.status(500).json({ error: e?.message || "Unexpected error" });
+    // Final safety net: never throw a platform error
+    return res.status(200).json({ ok: false, error: e?.message || "Unexpected error (caught)" });
   }
 }
+
 
